@@ -1,0 +1,56 @@
+remote:
+  host: "192.168.1.100"
+  port: 22
+  username: "your_user"
+  remote_base_dir: "/tmp/remote_job_runner"
+
+auth:
+  key_file: "~/.ssh/id_ed25519"
+  password: null
+  password_env: null
+
+job:
+  source_dir: "."
+  keep_backup: true
+  cleanup_remote_on_success: true
+  cleanup_remote_on_failure: false
+  verify_hash: true
+  skip_symlinks: false
+
+transfer:
+  include_globs:
+    - "**/*"
+  exclude_globs:
+    - ".git/**"
+    - "__pycache__/**"
+    - "*.tmp"
+    - ".remote_job_runner_logs/**"
+
+stages:
+  - name: "prepare"
+    mode: "sequential"
+    commands:
+      - name: "show_files"
+        cmd: "ls -la"
+        timeout_sec: 60
+
+  - name: "run_parallel_jobs"
+    mode: "parallel"
+    max_workers: 4
+    commands:
+      - name: "case_a"
+        cmd: "python run.py --case A"
+        timeout_sec: 3600
+      - name: "case_b"
+        cmd: "python run.py --case B"
+        timeout_sec: 3600
+      - name: "case_c"
+        cmd: "python run.py --case C"
+        timeout_sec: 3600
+
+  - name: "postprocess"
+    mode: "sequential"
+    commands:
+      - name: "collect"
+        cmd: "python collect_results.py"
+        timeout_sec: 600
