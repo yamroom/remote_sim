@@ -1,24 +1,22 @@
 # remote_job_runner
 
-`remote_job_runner` 是一個 Python CLI 工具，用來把本機指定資料夾複製到遠端 Linux 工作站的新工作資料夾，在遠端依照設定執行 sequential / parallel stages，成功後再把遠端工作資料夾安全同步回本機原資料夾。
+`remote_job_runner` 是 Python 3.10+ CLI 工具，用來把本機 `source_dir` 的檔案上傳到遠端 Linux 工作站的新工作目錄，在遠端依 YAML 設定執行 staged commands，成功後只下載 `results.remote_paths` 指定的結果，並 merge 回本機。
 
-設計重點是安全與可診斷性：
+新版行為重點：
 
-- 遠端 command 失敗時，不覆蓋本機 `source_dir`。
-- 下載結果驗證失敗時，不覆蓋本機 `source_dir`。
-- 本機原始資料夾不會被直接刪除，會先 rename 成 backup。
-- 預設拒絕未知 SSH host key。
-- 可在 YAML 直接寫 SSH password，但不建議把含密碼的 config commit 或分享。
-- password 不會寫入 resolved config；會以 `<redacted>` 顯示。
-- dry-run 不連線、不上傳、不下載、不執行 command、不修改 filesystem。
+- 不會下載整個 `remote_workdir`。
+- 不會整包替換或刪除本機 `source_dir`。
+- 只會新增或置換 `results.remote_paths` 指定的結果檔案。
+- 本機不屬於結果的既有檔案會保留。
+- 正式執行預設不再詢問 `Proceed?`；請用 `--dry-run` 先檢查計畫。若需要互動確認，使用 `--confirm`。
 
 ## 安裝
-
-需要 Python 3.10+。
 
 ```bash
 pip install -r requirements.txt
 ```
+
+如果使用 `transfer.method: "rsync"`，Windows 端還需要可用的 WSL，且 WSL 裡需要有 `rsync` 與 OpenSSH client。
 
 ## 基本使用
 
@@ -26,48 +24,21 @@ pip install -r requirements.txt
 python remote_job_runner.py --config config.yaml
 ```
 
-也可以用 CLI override 覆蓋 YAML 中的部分設定：
-
-```bash
-python remote_job_runner.py \
-  --config config.yaml \
-  --host 192.168.1.100 \
-  --port 22 \
-  --username myuser \
-  --source-dir /path/to/source \
-  --remote-base-dir /tmp/remote_job_runner \
-  --dry-run
-```
-
-## Dry-run
-
-dry-run 會讀取並驗證 config，掃描本機來源資料夾，列出會上傳的檔案與遠端 command 執行計畫。
-
-dry-run 不會：
-
-- 建立 lock file。
-- 連線 SSH。
-- 建立遠端資料夾。
-- 上傳或下載檔案。
-- 執行遠端 command。
-- rename 或刪除本機資料夾。
+Dry-run 不連 SSH、不上傳、不下載、不改動檔案：
 
 ```bash
 python remote_job_runner.py --config config.example.yaml --dry-run
 ```
 
-## YAML 設定檔總覽
+若需要執行前確認：
 
-`config.example.yaml` 是工具的主要設定檔範例，描述：
+```bash
+python remote_job_runner.py --config config.yaml --confirm
+```
 
-1. 要連到哪台遠端 Linux 工作站。
-2. 用什麼 SSH 認證方式。
-3. 要處理哪個本機資料夾。
-4. 哪些檔案要上傳或排除。
-5. 遠端要依序或平行執行哪些 commands。
-6. 成功或失敗時如何保留備份與清理遠端資料。
+`--yes` 只保留相容舊 CLI，目前是 no-op。
 
-完整範例：
+## YAML 範例
 
 ```yaml
 remote:
@@ -77,19 +48,23 @@ remote:
   remote_base_dir: "/tmp/remote_job_runner"
 
 auth:
-  key_file: "~/.ssh/id_ed25519"
+  key_file: null
   password: null
-  password_env: null
+  password_env: "WORKSTATION_PASSWORD"
 
 job:
-  source_dir: "."
-  keep_backup: true
+  source_dir: "/path/to/source"
+  enable_logs: true
+  show_progress: true
   cleanup_remote_on_success: true
   cleanup_remote_on_failure: false
-  verify_hash: true
+  verify_hash: false
   skip_symlinks: false
+  max_captured_output_bytes: 1048576
 
 transfer:
+  method: "sftp"
+  sftp_max_workers: 4
   include_globs:
     - "**/*"
   exclude_globs:
@@ -98,106 +73,44 @@ transfer:
     - "*.tmp"
     - ".remote_job_runner_logs/**"
 
+results:
+  remote_paths:
+    - "outputs/**"
+    - "result.csv"
+  local_base_dir: null
+  allow_local_base_dir_outside_source: false
+  overwrite: true
+  backup_overwritten: true
+  sync_mode: "merge"
+
 stages:
-  - name: "prepare"
+  - name: "run"
     mode: "sequential"
     commands:
-      - name: "show_files"
-        cmd: "ls -la"
-        timeout_sec: 60
-
-  - name: "run_parallel_jobs"
-    mode: "parallel"
-    max_workers: 4
-    commands:
-      - name: "case_a"
-        cmd: "python run.py --case A"
+      - name: "run_main"
+        cmd: "python test.py > /dev/null"
         timeout_sec: 3600
-      - name: "case_b"
-        cmd: "python run.py --case B"
-        timeout_sec: 3600
-      - name: "case_c"
-        cmd: "python run.py --case C"
-        timeout_sec: 3600
-
-  - name: "postprocess"
-    mode: "sequential"
-    commands:
-      - name: "collect"
-        cmd: "python collect_results.py"
-        timeout_sec: 600
 ```
 
-## `remote` 區塊
+## `remote`
 
-```yaml
-remote:
-  host: "192.168.1.100"
-  port: 22
-  username: "your_user"
-  remote_base_dir: "/tmp/remote_job_runner"
-```
+| 欄位 | 用途 |
+|---|---|
+| `host` | 遠端 Linux 工作站 hostname 或 IP |
+| `port` | SSH port，預設 22 |
+| `username` | SSH 使用者名稱 |
+| `remote_base_dir` | 遠端 job 目錄基底；工具會在裡面建立 `job_<timestamp>_<id>` |
 
-這段定義遠端 Linux 工作站連線資訊。
-
-| 欄位 | 意思 | 用途 |
-|---|---|---|
-| `host` | 遠端主機 IP 或 hostname | SSH 連線目標，例如 `192.168.1.100` |
-| `port` | SSH port | 通常是 `22` |
-| `username` | SSH 使用者名稱 | 用來登入遠端工作站 |
-| `remote_base_dir` | 遠端 job 根目錄 | 工具會在這下面建立唯一工作資料夾 |
-
-實際遠端工作資料夾會長得像：
-
-```text
-/tmp/remote_job_runner/job_20260521_153000_ab12cd34
-```
-
-## `auth` 區塊
-
-```yaml
-auth:
-  key_file: "~/.ssh/id_ed25519"
-  password: null
-  password_env: null
-```
-
-這段定義 SSH 認證方式。
-
-| 欄位 | 意思 | 用途 |
-|---|---|---|
-| `key_file` | SSH private key 路徑 | 優先使用 SSH key 登入 |
-| `password` | SSH 密碼本身 | 直接從 YAML 讀取密碼 |
-| `password_env` | 存放密碼的環境變數名稱 | 從環境變數讀取密碼 |
+## `auth`
 
 認證優先順序：
 
 1. `key_file`
 2. `password`
 3. `password_env`
-4. 互動式 `getpass` 輸入
+4. `transfer.method: "sftp"` 且前三者都沒有時，才互動式詢問 password
 
-目前範例使用 SSH key：
-
-```yaml
-auth:
-  key_file: "~/.ssh/id_ed25519"
-  password: null
-  password_env: null
-```
-
-如果要直接在 YAML 寫密碼：
-
-```yaml
-auth:
-  key_file: null
-  password: "12345"
-  password_env: null
-```
-
-`password` 是真實 SSH 密碼。若密碼是純數字，建議加引號，例如 `"12345"`。如果不加引號，YAML 會把 `12345` 解析成整數；本工具會把它轉成字串，但像 `00123` 這類有前導零的密碼可能會因 YAML 解析而失真。
-
-如果要改用密碼環境變數：
+`password_env` 是環境變數名稱，不是密碼本身：
 
 ```yaml
 auth:
@@ -206,316 +119,182 @@ auth:
   password_env: "WORKSTATION_PASSWORD"
 ```
 
-然後在 shell 設定：
+PowerShell：
 
-```bash
-export WORKSTATION_PASSWORD="your-password"
+```powershell
+$env:WORKSTATION_PASSWORD = "12345"
 python remote_job_runner.py --config config.yaml
 ```
 
-直接把 password 寫進 YAML 比較方便，但安全性較低。config 檔可能被 commit、複製、備份或附在 bug report，造成 secret 外洩。若使用 `auth.password`，工具會在 `config.resolved.yaml` 中以 `<redacted>` 取代真實密碼，但原始 YAML 仍然含有密碼，請妥善保管。
+也可以直接在 YAML 寫 password：
 
-## `job` 區塊
+```yaml
+auth:
+  key_file: null
+  password: "12345"
+  password_env: null
+```
+
+不建議把真實密碼 commit 到 git。若密碼是純數字，請加引號，例如 `"12345"`，避免 YAML 型別轉換造成誤解。`config.resolved.yaml` 會把 `auth.password` 顯示為 `<redacted>`。
+
+## `job`
+
+| 欄位 | 預設 | 用途 |
+|---|---:|---|
+| `source_dir` | 必填 | 本機要上傳的資料夾 |
+| `enable_logs` | `true` | 是否建立 `.remote_job_runner_logs` 與檔案 log |
+| `show_progress` | `true` | 是否輸出帶時間戳的 manifest、transfer、stage、merge 進度 |
+| `cleanup_remote_on_success` | `true` | 成功後是否刪除遠端 working directory |
+| `cleanup_remote_on_failure` | `false` | 失敗後是否刪除遠端 working directory |
+| `verify_hash` | `true` | manifest 是否計算 sha256；較安全但較慢 |
+| `skip_symlinks` | `false` | 是否跳過 symlink；預設遇到 symlink 會失敗 |
+| `max_captured_output_bytes` | `1048576` | 每個 command stdout/stderr 在記憶體中保留的尾端 bytes |
+
+關閉 logs：
 
 ```yaml
 job:
-  source_dir: "."
-  keep_backup: true
-  cleanup_remote_on_success: true
-  cleanup_remote_on_failure: false
-  verify_hash: true
-  skip_symlinks: false
+  enable_logs: false
 ```
 
-這段定義本機 job 行為與安全策略。
-
-| 欄位 | 意思 | 用途 |
-|---|---|---|
-| `source_dir` | 本機來源資料夾 | 要上傳到遠端，最後被安全替換的資料夾 |
-| `keep_backup` | 是否保留本機原始資料夾備份 | 預設保留，較安全 |
-| `cleanup_remote_on_success` | 成功後是否刪除遠端工作資料夾 | 預設成功後清理遠端 |
-| `cleanup_remote_on_failure` | 失敗後是否刪除遠端工作資料夾 | 預設不刪，方便 debug |
-| `verify_hash` | 是否計算 sha256 | 用於 manifest 與下載結果驗證 |
-| `skip_symlinks` | 是否跳過 symlink | 預設不跳過，遇到 symlink 直接報錯 |
-
-正式使用時通常會把：
+關閉一般進度：
 
 ```yaml
-source_dir: "."
+job:
+  show_progress: false
 ```
 
-改成：
+`show_progress: false` 不顯示一般進度，但錯誤仍會照常輸出。
 
-```yaml
-source_dir: "/path/to/local/source_folder"
+## Progress Timestamp
+
+`show_progress: true` 時，console 進度會使用 ISO-8601 UTC timestamp：
+
+```text
+[2026-05-22T12:34:56.789012+00:00] phase started: upload
+[2026-05-22T12:35:01.123456+00:00] sftp upload progress: completed=50/200, file=outputs/a.txt
+[2026-05-22T12:35:20.234567+00:00] stage completed: name=run, success=true, duration_sec=18.420
 ```
 
-`keep_backup: true` 很重要。成功下載結果後，工具不會直接刪除原本資料夾，而是先 rename 成 backup，再把 result rename 回原本路徑。
+Progress 不會顯示 SSH password。不過 command 字串仍可能寫入 command log，所以不建議在 command 裡直接放 secret。
 
-## `transfer` 區塊
+## `transfer`
+
+只需要設定 `method`、`sftp_max_workers`、`include_globs`、`exclude_globs`。
+
+| method | 行為 |
+|---|---|
+| `sftp` | 使用 Paramiko SFTP。支援 SSH key、直接 password、`password_env`，也可在沒有 auth 時互動輸入 password。 |
+| `rsync` | 透過 Windows 端 Python 呼叫 `wsl rsync`。支援 SSH key、直接 password、`password_env`；password 模式內部使用 SSH_ASKPASS helper。 |
+
+### SFTP sequential upload
+
+預設 SFTP 是 sequential：
 
 ```yaml
 transfer:
-  include_globs:
-    - "**/*"
-  exclude_globs:
-    - ".git/**"
-    - "__pycache__/**"
-    - "*.tmp"
-    - ".remote_job_runner_logs/**"
+  method: "sftp"
+  sftp_max_workers: 1
 ```
 
-這段定義哪些檔案會被上傳。
+### SFTP parallel upload
 
-`include_globs` 是納入規則：
-
-```yaml
-include_globs:
-  - "**/*"
-```
-
-代表遞迴包含所有檔案與子資料夾。
-
-`exclude_globs` 是排除規則，而且優先於 include：
-
-| 規則 | 用途 |
-|---|---|
-| `.git/**` | 不上傳 git metadata |
-| `__pycache__/**` | 不上傳 Python bytecode cache |
-| `*.tmp` | 不上傳暫存檔 |
-| `.remote_job_runner_logs/**` | 不上傳本工具自己的 log |
-
-如果只想上傳 Python 與資料檔，可改成：
+開啟平行 SFTP：
 
 ```yaml
 transfer:
-  include_globs:
-    - "**/*.py"
-    - "**/*.csv"
-  exclude_globs:
-    - ".git/**"
-    - "__pycache__/**"
+  method: "sftp"
+  sftp_max_workers: 4
 ```
 
-## `stages` 區塊
+建議：
 
-`stages` 是遠端 commands 的執行流程。每個 stage 有：
+- 先從 `2` 或 `4` 開始測。
+- 很多小檔案通常較有幫助。
+- 單一大檔案通常幫助有限。
+- 數值太高可能被遠端 SSH server 限制 channel/session 數。
+- 若遇到 `channel open failed` 或 `too many sessions`，請降低 `sftp_max_workers`。
 
-| 欄位 | 意思 |
+實作上每個 worker 會開自己的 SFTPClient，不會多 thread 共用同一個 SFTPClient。目錄會在平行上傳前 sequential 建立，避免多 worker race 建立同一個資料夾。
+
+### rsync
+
+`rsync` 內部固定使用：
+
+- WSL command：`wsl`
+- rsync command：`rsync`
+
+這些不是 YAML 設定欄位。
+
+`rsync` password auth 會暫時建立 SSH_ASKPASS helper。script 本身不包含 password，只會讀取 subprocess env 裡的 `REMOTE_JOB_RUNNER_SSH_PASSWORD`。password 不會出現在 command line、resolved config、dry-run、log 或 exception message。
+
+若 `rsync` password auth 在你的 WSL/OpenSSH 環境失敗，請改用 `transfer.method: "sftp"` 或 SSH key。
+
+### Host key policy
+
+- `sftp` 使用 Paramiko `RejectPolicy`，預設拒絕未知 host key。
+- `rsync` 使用 WSL 的 OpenSSH `known_hosts`。
+- 預設不使用 `StrictHostKeyChecking=no`，也不使用 `UserKnownHostsFile=/dev/null`。
+- 第一次連線若 host key unknown，建議先在 WSL 裡執行：
+
+```bash
+ssh -p <port> <username>@<host>
+```
+
+也可以用 `--auto-add-host-key`，此時 rsync 會加上 `StrictHostKeyChecking=accept-new`。這會降低首次連線安全性，請只在你確認 host 正確時使用。
+
+## `results`
+
+`results.remote_paths` 是成功後要從遠端 working directory 下載的結果清單。它必須明確指定；空 list 會被拒絕，工具不會退回下載整個 working directory。
+
+| 欄位 | 用途 |
 |---|---|
-| `name` | stage 名稱，用於 log 與結果識別 |
-| `mode` | 執行模式，只能是 `sequential` 或 `parallel` |
-| `commands` | 此 stage 內要執行的 command 清單 |
+| `remote_paths` | 遠端 working directory 內要下載的相對 path / glob |
+| `local_base_dir` | 結果 merge 到本機哪個資料夾；`null` 或未指定時是 resolved `job.source_dir` |
+| `allow_local_base_dir_outside_source` | 是否允許寫到 `source_dir` 外，預設 `false` |
+| `overwrite` | 目標檔案已存在時是否覆蓋 |
+| `backup_overwritten` | 覆蓋前是否備份舊檔 |
+| `sync_mode` | 目前只支援 `merge` |
 
-### Sequential stage
+Merge 行為：
 
-```yaml
-- name: "prepare"
-  mode: "sequential"
-  commands:
-    - name: "show_files"
-      cmd: "ls -la"
-      timeout_sec: 60
-```
+- 新結果檔會新增。
+- 同名結果檔依 `overwrite` 決定覆蓋或失敗。
+- 非結果檔案會保留。
+- 資料夾會遞迴 merge，不會刪除本機資料夾內未下載的其他檔案。
 
-這代表準備階段，commands 依照 YAML 順序執行。
+## `stages`
 
-這個 command 會在遠端 working directory 裡執行：
+`sequential` stage 依序執行 commands。任一 command 失敗或 timeout，就停止該 stage 與後續 stage。
 
-```bash
-ls -la
-```
-
-最多允許 60 秒。若 command 失敗或 timeout，這個 stage 失敗，後續 commands 與後續 stages 都不會執行。
-
-### Parallel stage
-
-```yaml
-- name: "run_parallel_jobs"
-  mode: "parallel"
-  max_workers: 4
-  commands:
-    - name: "case_a"
-      cmd: "python run.py --case A"
-      timeout_sec: 3600
-    - name: "case_b"
-      cmd: "python run.py --case B"
-      timeout_sec: 3600
-    - name: "case_c"
-      cmd: "python run.py --case C"
-      timeout_sec: 3600
-```
-
-這段代表同一 stage 內的 commands 平行執行。
-
-| 欄位 | 意思 |
-|---|---|
-| `mode: "parallel"` | 同一 stage 的 commands 平行跑 |
-| `max_workers: 4` | 最多同時跑 4 個 command |
-| `timeout_sec: 3600` | 每個 command 最多跑 3600 秒 |
-
-這三個 command 會在遠端 working directory 平行執行：
-
-```bash
-python run.py --case A
-python run.py --case B
-python run.py --case C
-```
-
-如果其中任何一個失敗或 timeout，整個 stage 會失敗。工具會等待同 stage 內已啟動的 commands 結束，然後停止後續 stage，不會下載結果，也不會替換本機 `source_dir`。
-
-### Postprocess stage
-
-```yaml
-- name: "postprocess"
-  mode: "sequential"
-  commands:
-    - name: "collect"
-      cmd: "python collect_results.py"
-      timeout_sec: 600
-```
-
-這段是後處理階段。因為是 `sequential`，它會在前面的 stages 全部成功後才執行。
-
-常見用途：
-
-- 合併結果。
-- 產生報表。
-- 整理輸出檔案。
-- 清理遠端 working directory 內的中間產物。
-
-## YAML 範例的完整執行流程
-
-依照 `config.example.yaml`，工具會：
-
-1. 掃描本機 `source_dir`。
-2. 排除 `.git/**`、`__pycache__/**`、`*.tmp`、`.remote_job_runner_logs/**`。
-3. 依照 auth 優先順序使用 SSH key、YAML password、password_env 或互動式輸入連到 `your_user@192.168.1.100:22`。
-4. 在 `/tmp/remote_job_runner` 下建立唯一 job 目錄。
-5. 上傳符合規則的檔案。
-6. 遠端依序執行 `ls -la`。
-7. 遠端平行執行 `python run.py --case A`、`python run.py --case B`、`python run.py --case C`。
-8. 如果前面都成功，遠端執行 `python collect_results.py`。
-9. 全部成功後下載遠端 working directory。
-10. 驗證下載結果。
-11. 安全替換本機 `source_dir`。
-12. 保留本機 backup。
-13. 成功後清理遠端 working directory。
-
-若任何 command 失敗，工具不會覆蓋本機 `source_dir`。
-
-## 必填欄位與預設值
-
-必填欄位：
-
-- `remote.host`
-- `remote.username`
-- `remote.remote_base_dir`
-- `job.source_dir`
-- 至少一個 stage
-- 每個 stage 至少一個 command
-- 每個 command 必須有 `name` 與 `cmd`
-
-預設值：
-
-- `remote.port`: `22`
-- `job.keep_backup`: `true`
-- `job.cleanup_remote_on_success`: `true`
-- `job.cleanup_remote_on_failure`: `false`
-- `job.verify_hash`: `true`
-- `job.skip_symlinks`: `false`
-- `transfer.include_globs`: `["**/*"]`
-- `transfer.exclude_globs`: `[]`
-- command `timeout_sec`: `3600`
-- parallel stage `max_workers`: `min(4, command_count)`
-
-## Host key policy
-
-預設行為：
-
-1. 呼叫 `client.load_system_host_keys()`。
-2. 使用 Paramiko `RejectPolicy`。
-3. 未知 host key 會被拒絕。
-
-只有明確指定以下參數時，才會自動信任未知 host key：
-
-```bash
-python remote_job_runner.py --config config.yaml --auto-add-host-key
-```
-
-`--auto-add-host-key` 會降低 SSH 安全性，因為第一次連線到惡意主機時也可能自動信任對方。只應在你完全理解風險且環境受控時使用。
-
-## Safe swap
-
-所有遠端 stages 成功後，工具才會下載結果並進入 safe swap。
-
-流程：
-
-1. 下載遠端 working directory 到本機臨時 result directory。
-2. 建立 `manifest.after_download.json`。
-3. 將原本 `source_dir` rename 成 backup directory。
-4. 將 result directory rename 成原本的 `source_dir` path。
-5. 如果第 4 步失敗，嘗試 rollback：把 backup rename 回 `source_dir`。
-6. `keep_backup: true` 時保留 backup。
-7. `keep_backup: false` 時，成功替換後才刪除 backup。
-
-關閉 backup 保留：
-
-```bash
-python remote_job_runner.py --config config.yaml --no-keep-backup
-```
-
-## 失敗時如何恢復
-
-如果 remote command、transfer、verification 或 safe swap 失敗，本機 `source_dir` 不會被覆蓋。
-
-如果 job 成功，但你想恢復舊內容，先確認沒有其他 job 正在操作同一資料夾，再把 backup rename 回來。
-
-Linux / macOS 範例：
-
-```bash
-mv /path/to/source /path/to/source.failed_or_unwanted
-mv /path/to/source.backup_job_id /path/to/source
-```
-
-Windows 請使用 PowerShell 或檔案總管做等價 rename。
+`parallel` stage 會平行執行同一 stage 內的 commands，等待全部完成後收集結果。結果順序會依 YAML command 順序整理。若任一 command 失敗或 timeout，stage 視為失敗。
 
 ## Logs
 
-每次實際執行 job 會建立：
+`enable_logs: true` 時，每次 job 建立：
 
 ```text
 <source_parent>/.remote_job_runner_logs/job_<job_id>/
 ```
 
-內容：
+內容包含：
 
-- `job.log`: 高層流程 log。
-- `config.resolved.yaml`: resolved config；若 YAML 有 `auth.password`，會以 `<redacted>` 顯示。
-- `manifest.before_upload.json`: 上傳前本機 manifest。
-- `manifest.after_download.json`: 下載後 result manifest。
-- `commands.json`: command start/end/duration/exit code/timeout 狀態。
-- `stdout_stderr/<stage>_<command>.log`: 每個 command 的 stdout 與 stderr。
+- `job.log`
+- `config.resolved.yaml`
+- `manifest.before_upload.json`
+- `manifest.after_download.json`
+- `commands.json`
+- `stdout_stderr/<stage>_<command>.log`
+- `overwritten_backup/`，若覆蓋結果且 `backup_overwritten: true`
 
-## Cleanup
+`commands.json` 只保存 command metadata、exit code、duration、stdout/stderr byte counts，不保存完整 stdout/stderr，避免 JSON 過大。
 
-成功時：
+## Known Limitations
 
-- 如果 `job.cleanup_remote_on_success: true`，工具會刪除遠端 working directory。
-- 如果遠端 cleanup 失敗，job 仍視為成功，但會在 log 中記錄 warning。
-
-失敗時：
-
-- 預設 `job.cleanup_remote_on_failure: false`。
-- 不覆蓋本機 `source_dir`。
-- 不刪除本機原始資料。
-- 保留遠端 working directory 供 debug。
-- 如果設定 `job.cleanup_remote_on_failure: true`，失敗後也會嘗試刪除遠端 working directory。
-
-## Known limitations
-
-- 第一版使用 recursive SFTP transfer，不是 rsync。
+- `rsync` method 需要 WSL 與 WSL 內的 rsync/OpenSSH。
+- `rsync` password auth 依賴 OpenSSH 的 SSH_ASKPASS 行為；若環境不支援，請改用 `sftp` 或 SSH key。
+- SFTP 平行上傳受遠端 SSH server session/channel 限制。
 - 不支援 interrupted upload resume。
-- symlink 預設不支援；可設定 `skip_symlinks: true` 跳過。
-- parallel commands 如果同時寫同一個檔案，使用者必須自行避免 race condition。
-- 遠端 command 是 trusted shell command，本工具只負責執行與記錄，不分析 command 本身是否危險。
+- symlink 預設不支援；可用 `skip_symlinks: true` 跳過。
+- parallel commands 若同時寫同一個檔案，使用者必須自行避免 race condition。
+- 遠端 command 視為 trusted shell command；本工具只負責 quoting workdir/cmd wrapper、執行、記錄與 timeout，不分析 command 本身是否危險。

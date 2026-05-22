@@ -5,19 +5,23 @@ remote:
   remote_base_dir: "/tmp/remote_job_runner"
 
 auth:
-  key_file: "~/.ssh/id_ed25519"
+  key_file: null
   password: null
-  password_env: null
+  password_env: "WORKSTATION_PASSWORD"
 
 job:
-  source_dir: "."
-  keep_backup: true
+  source_dir: "/path/to/source"
+  enable_logs: true
+  show_progress: true
   cleanup_remote_on_success: true
   cleanup_remote_on_failure: false
-  verify_hash: true
+  verify_hash: false
   skip_symlinks: false
+  max_captured_output_bytes: 1048576
 
 transfer:
+  method: "sftp"
+  sftp_max_workers: 4
   include_globs:
     - "**/*"
   exclude_globs:
@@ -25,32 +29,23 @@ transfer:
     - "__pycache__/**"
     - "*.tmp"
     - ".remote_job_runner_logs/**"
+    - ".remote_job_runner_download_*/**"
+    - ".remote_job_runner_overwritten_backup/**"
+
+results:
+  remote_paths:
+    - "outputs/**"
+    - "result.csv"
+  local_base_dir: null
+  allow_local_base_dir_outside_source: false
+  overwrite: true
+  backup_overwritten: true
+  sync_mode: "merge"
 
 stages:
-  - name: "prepare"
+  - name: "run"
     mode: "sequential"
     commands:
-      - name: "show_files"
-        cmd: "ls -la"
-        timeout_sec: 60
-
-  - name: "run_parallel_jobs"
-    mode: "parallel"
-    max_workers: 4
-    commands:
-      - name: "case_a"
-        cmd: "python run.py --case A"
+      - name: "run_main"
+        cmd: "python test.py > /dev/null"
         timeout_sec: 3600
-      - name: "case_b"
-        cmd: "python run.py --case B"
-        timeout_sec: 3600
-      - name: "case_c"
-        cmd: "python run.py --case C"
-        timeout_sec: 3600
-
-  - name: "postprocess"
-    mode: "sequential"
-    commands:
-      - name: "collect"
-        cmd: "python collect_results.py"
-        timeout_sec: 600
