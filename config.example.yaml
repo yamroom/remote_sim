@@ -49,3 +49,14 @@ stages:
       - name: "run_main"
         cmd: "python test.py > /dev/null"
         timeout_sec: 3600
+
+  - name: "parallel_cases"
+    mode: "parallel"
+    max_workers: 2
+    commands:
+      - name: "case_a"
+        cmd: "python test.py --case A > /dev/null"
+        timeout_sec: 3600
+      - name: "case_b"
+        cmd: "python test.py --case B > /dev/null"
+        timeout_sec: 3600

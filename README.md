@@ -2,14 +2,6 @@
 
 `remote_job_runner` 是 Python 3.10+ CLI 工具，用來把本機 `source_dir` 的檔案上傳到遠端 Linux 工作站的新工作目錄，在遠端依 YAML 設定執行 staged commands，成功後只下載 `results.remote_paths` 指定的結果，並 merge 回本機。
 
-新版行為重點：
-
-- 不會下載整個 `remote_workdir`。
-- 不會整包替換或刪除本機 `source_dir`。
-- 只會新增或置換 `results.remote_paths` 指定的結果檔案。
-- 本機不屬於結果的既有檔案會保留。
-- 正式執行預設不再詢問 `Proceed?`；請用 `--dry-run` 先檢查計畫。若需要互動確認，使用 `--confirm`。
-
 ## 安裝
 
 ```bash
@@ -90,16 +82,18 @@ stages:
       - name: "run_main"
         cmd: "python test.py > /dev/null"
         timeout_sec: 3600
+
+  - name: "parallel_cases"
+    mode: "parallel"
+    max_workers: 2
+    commands:
+      - name: "case_a"
+        cmd: "python test.py --case A > /dev/null"
+        timeout_sec: 3600
+      - name: "case_b"
+        cmd: "python test.py --case B > /dev/null"
+        timeout_sec: 3600
 ```
-
-## `remote`
-
-| 欄位 | 用途 |
-|---|---|
-| `host` | 遠端 Linux 工作站 hostname 或 IP |
-| `port` | SSH port，預設 22 |
-| `username` | SSH 使用者名稱 |
-| `remote_base_dir` | 遠端 job 目錄基底；工具會在裡面建立 `job_<timestamp>_<id>` |
 
 ## `auth`
 
@@ -112,30 +106,12 @@ stages:
 
 `password_env` 是環境變數名稱，不是密碼本身：
 
-```yaml
-auth:
-  key_file: null
-  password: null
-  password_env: "WORKSTATION_PASSWORD"
-```
-
-PowerShell：
-
 ```powershell
 $env:WORKSTATION_PASSWORD = "12345"
 python remote_job_runner.py --config config.yaml
 ```
 
-也可以直接在 YAML 寫 password：
-
-```yaml
-auth:
-  key_file: null
-  password: "12345"
-  password_env: null
-```
-
-不建議把真實密碼 commit 到 git。若密碼是純數字，請加引號，例如 `"12345"`，避免 YAML 型別轉換造成誤解。`config.resolved.yaml` 會把 `auth.password` 顯示為 `<redacted>`。
+不建議把真實密碼 commit 到 git。`config.resolved.yaml` 會把 `auth.password` 顯示為 `<redacted>`。
 
 ## `job`
 
@@ -143,36 +119,17 @@ auth:
 |---|---:|---|
 | `source_dir` | 必填 | 本機要上傳的資料夾 |
 | `enable_logs` | `true` | 是否建立 `.remote_job_runner_logs` 與檔案 log |
-| `show_progress` | `true` | 是否輸出帶時間戳的 manifest、transfer、stage、merge 進度 |
+| `show_progress` | `true` | 是否輸出帶時間戳的進度 |
 | `cleanup_remote_on_success` | `true` | 成功後是否刪除遠端 working directory |
 | `cleanup_remote_on_failure` | `false` | 失敗後是否刪除遠端 working directory |
 | `verify_hash` | `true` | manifest 是否計算 sha256；較安全但較慢 |
 | `skip_symlinks` | `false` | 是否跳過 symlink；預設遇到 symlink 會失敗 |
 | `max_captured_output_bytes` | `1048576` | 每個 command stdout/stderr 在記憶體中保留的尾端 bytes |
 
-關閉 logs：
-
-```yaml
-job:
-  enable_logs: false
-```
-
-關閉一般進度：
-
-```yaml
-job:
-  show_progress: false
-```
-
-`show_progress: false` 不顯示一般進度，但錯誤仍會照常輸出。
-
-## Progress Timestamp
-
 `show_progress: true` 時，console 進度會使用 ISO-8601 UTC timestamp：
 
 ```text
 [2026-05-22T12:34:56.789012+00:00] phase started: upload
-[2026-05-22T12:35:01.123456+00:00] sftp upload progress: completed=50/200, file=outputs/a.txt
 [2026-05-22T12:35:20.234567+00:00] stage completed: name=run, success=true, duration_sec=18.420
 ```
 
@@ -180,16 +137,12 @@ Progress 不會顯示 SSH password。不過 command 字串仍可能寫入 comman
 
 ## `transfer`
 
-只需要設定 `method`、`sftp_max_workers`、`include_globs`、`exclude_globs`。
-
 | method | 行為 |
 |---|---|
 | `sftp` | 使用 Paramiko SFTP。支援 SSH key、直接 password、`password_env`，也可在沒有 auth 時互動輸入 password。 |
 | `rsync` | 透過 Windows 端 Python 呼叫 `wsl rsync`。支援 SSH key、直接 password、`password_env`；password 模式內部使用 SSH_ASKPASS helper。 |
 
-### SFTP sequential upload
-
-預設 SFTP 是 sequential：
+SFTP 預設 sequential：
 
 ```yaml
 transfer:
@@ -197,9 +150,7 @@ transfer:
   sftp_max_workers: 1
 ```
 
-### SFTP parallel upload
-
-開啟平行 SFTP：
+開啟 SFTP parallel upload：
 
 ```yaml
 transfer:
@@ -207,41 +158,7 @@ transfer:
   sftp_max_workers: 4
 ```
 
-建議：
-
-- 先從 `2` 或 `4` 開始測。
-- 很多小檔案通常較有幫助。
-- 單一大檔案通常幫助有限。
-- 數值太高可能被遠端 SSH server 限制 channel/session 數。
-- 若遇到 `channel open failed` 或 `too many sessions`，請降低 `sftp_max_workers`。
-
-實作上每個 worker 會開自己的 SFTPClient，不會多 thread 共用同一個 SFTPClient。目錄會在平行上傳前 sequential 建立，避免多 worker race 建立同一個資料夾。
-
-### rsync
-
-`rsync` 內部固定使用：
-
-- WSL command：`wsl`
-- rsync command：`rsync`
-
-這些不是 YAML 設定欄位。
-
-`rsync` password auth 會暫時建立 SSH_ASKPASS helper。script 本身不包含 password，只會讀取 subprocess env 裡的 `REMOTE_JOB_RUNNER_SSH_PASSWORD`。password 不會出現在 command line、resolved config、dry-run、log 或 exception message。
-
-若 `rsync` password auth 在你的 WSL/OpenSSH 環境失敗，請改用 `transfer.method: "sftp"` 或 SSH key。
-
-### Host key policy
-
-- `sftp` 使用 Paramiko `RejectPolicy`，預設拒絕未知 host key。
-- `rsync` 使用 WSL 的 OpenSSH `known_hosts`。
-- 預設不使用 `StrictHostKeyChecking=no`，也不使用 `UserKnownHostsFile=/dev/null`。
-- 第一次連線若 host key unknown，建議先在 WSL 裡執行：
-
-```bash
-ssh -p <port> <username>@<host>
-```
-
-也可以用 `--auto-add-host-key`，此時 rsync 會加上 `StrictHostKeyChecking=accept-new`。這會降低首次連線安全性，請只在你確認 host 正確時使用。
+建議先從 `2` 或 `4` 開始測。很多小檔案通常較有幫助；單一大檔案通常幫助有限。若遇到 `channel open failed` 或 `too many sessions`，請降低 `sftp_max_workers`。
 
 ## `results`
 
@@ -256,18 +173,39 @@ ssh -p <port> <username>@<host>
 | `backup_overwritten` | 覆蓋前是否備份舊檔 |
 | `sync_mode` | 目前只支援 `merge` |
 
-Merge 行為：
-
-- 新結果檔會新增。
-- 同名結果檔依 `overwrite` 決定覆蓋或失敗。
-- 非結果檔案會保留。
-- 資料夾會遞迴 merge，不會刪除本機資料夾內未下載的其他檔案。
-
 ## `stages`
 
-`sequential` stage 依序執行 commands。任一 command 失敗或 timeout，就停止該 stage 與後續 stage。
+`stages` 定義遠端 commands 的執行順序。每個 stage 都有 `name`、`mode` 與 `commands`。
 
-`parallel` stage 會平行執行同一 stage 內的 commands，等待全部完成後收集結果。結果順序會依 YAML command 順序整理。若任一 command 失敗或 timeout，stage 視為失敗。
+`sequential` stage 會依 YAML 順序逐一執行同一 stage 內的 commands。任一 command 失敗或 timeout，就停止該 stage 的後續 commands，也不會繼續執行後續 stage。
+
+```yaml
+- name: "run"
+  mode: "sequential"
+  commands:
+    - name: "run_main"
+      cmd: "python test.py > /dev/null"
+      timeout_sec: 3600
+```
+
+`parallel` stage 會平行執行同一 stage 內的 commands，並等待全部完成後再判斷 stage 成功或失敗。若任一 command 失敗或 timeout，整個 stage 視為失敗。
+
+```yaml
+- name: "parallel_cases"
+  mode: "parallel"
+  max_workers: 2
+  commands:
+    - name: "case_a"
+      cmd: "python test.py --case A > /dev/null"
+      timeout_sec: 3600
+    - name: "case_b"
+      cmd: "python test.py --case B > /dev/null"
+      timeout_sec: 3600
+```
+
+`max_workers` 限制同一個 parallel stage 內最多同時執行幾個 command。若未設定，程式會使用預設值 `min(4, command_count)`。parallel command 的完成順序可能和 YAML 順序不同，但 `commands.json` 與 `StageResult.command_results` 會依 YAML command 順序整理。
+
+請避免多個 parallel commands 同時寫入同一個檔案；這種 race condition 需要由使用者自行避免。
 
 ## Logs
 
@@ -287,14 +225,11 @@ Merge 行為：
 - `stdout_stderr/<stage>_<command>.log`
 - `overwritten_backup/`，若覆蓋結果且 `backup_overwritten: true`
 
-`commands.json` 只保存 command metadata、exit code、duration、stdout/stderr byte counts，不保存完整 stdout/stderr，避免 JSON 過大。
-
 ## Known Limitations
 
 - `rsync` method 需要 WSL 與 WSL 內的 rsync/OpenSSH。
 - `rsync` password auth 依賴 OpenSSH 的 SSH_ASKPASS 行為；若環境不支援，請改用 `sftp` 或 SSH key。
 - SFTP 平行上傳受遠端 SSH server session/channel 限制。
-- 不支援 interrupted upload resume。
 - symlink 預設不支援；可用 `skip_symlinks: true` 跳過。
 - parallel commands 若同時寫同一個檔案，使用者必須自行避免 race condition。
-- 遠端 command 視為 trusted shell command；本工具只負責 quoting workdir/cmd wrapper、執行、記錄與 timeout，不分析 command 本身是否危險。
+- 遠端 command 視為 trusted shell command；本工具只負責執行與記錄，不分析 command 本身是否危險。
